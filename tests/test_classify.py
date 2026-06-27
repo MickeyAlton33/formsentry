@@ -162,6 +162,29 @@ def test_decode_then_extract():
     assert any("ZZZ999" in u for u in links)
 
 
+def test_parse_selection():
+    assert fs._parse_selection("", 4) == [0, 1, 2, 3]
+    assert fs._parse_selection("all", 4) == [0, 1, 2, 3]
+    assert fs._parse_selection("1,3", 4) == [0, 2]
+    assert fs._parse_selection("1-3", 4) == [0, 1, 2]
+    assert fs._parse_selection("2 4", 4) == [1, 3]
+    assert fs._parse_selection("9", 4) == []          # out of range dropped
+
+
+def test_extract_result_urls_filters_engines():
+    body = ('<a href="https://activitymessenger.com/blog/x">r</a>'
+            '<a href="https://www.mojeek.com/about">nav</a>'
+            '<a href="https://facebook.com/share">soc</a>'
+            '<a href="https://club.example.org/register">good</a>'
+            '<a href="https://cdn.example.org/logo.png">img</a>')
+    urls = fs._extract_result_urls(body)
+    assert "https://activitymessenger.com/blog/x" in urls
+    assert "https://club.example.org/register" in urls
+    assert all("mojeek.com" not in u for u in urls)
+    assert all("facebook.com" not in u for u in urls)
+    assert all(not u.endswith(".png") for u in urls)
+
+
 if __name__ == "__main__":
     import traceback
     failed = 0

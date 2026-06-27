@@ -78,6 +78,27 @@ install -m 0755 formsentry.py /usr/local/bin/formsentry
 
 ## Usage
 
+### Interactive wizard 🧙 (easiest)
+
+Don't want to remember flags? Run the guided, approval-gated wizard:
+
+```bash
+python3 formsentry.py --wizard
+```
+
+It walks you through everything, asking for confirmation at each step:
+
+1. Confirms you're **authorized** to assess the target.
+2. Pick a mode — hunt by **keyword**, hunt an **organization** (name + domain),
+   **scan a page/Linktree**, or assess **specific form URLs**.
+3. Shows the forms it found and lets you **choose which** to assess (`all`,
+   `1,3`, `1-4`, …).
+4. Asks before touching the forms, then assesses and prints the report +
+   mass-analysis summary.
+5. Optionally **exports** Markdown or JSON.
+
+Everything else below is the same functionality via direct flags.
+
 ### Assess known forms
 
 ```bash

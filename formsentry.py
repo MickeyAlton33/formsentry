@@ -37,7 +37,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 USER_AGENT = f"FormSentry/{__version__} (+https://github.com/MickeyAlton33/formsentry)"
 TIMEOUT = 20
@@ -951,6 +951,9 @@ def render_summary_md(s: dict) -> str:
 EXAMPLES = r"""
 EXAMPLES — full command chains
 
+  Interactive guided wizard (easiest)
+    formsentry.py --wizard
+
   Assess one form
     formsentry.py https://forms.gle/XXXXXXXX
 
@@ -994,6 +997,170 @@ def render_dorks(keywords: str, site: Optional[str], color: bool = True) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Interactive wizard
+# --------------------------------------------------------------------------- #
+
+def _ask(prompt: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        val = input(_c("1", f"? ") + prompt + suffix + ": ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit(130)
+    return val or default
+
+
+def _ask_yesno(prompt: str, default_yes: bool = False) -> bool:
+    d = "Y/n" if default_yes else "y/N"
+    v = _ask(prompt + f" ({d})").strip().lower()
+    if not v:
+        return default_yes
+    return v in ("y", "yes")
+
+
+def _parse_selection(sel: str, n: int) -> List[int]:
+    """Parse '1,3,5' / '1-4' / 'all' into 0-based indices."""
+    sel = sel.strip().lower()
+    if sel in ("", "a", "all", "*"):
+        return list(range(n))
+    idx: List[int] = []
+    for part in re.split(r"[,\s]+", sel):
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                a, b = part.split("-", 1)
+                idx.extend(range(int(a) - 1, int(b)))
+            except ValueError:
+                continue
+        elif part.isdigit():
+            idx.append(int(part) - 1)
+    return [i for i in idx if 0 <= i < n]
+
+
+def run_wizard() -> int:
+    """Guided, approval-gated flow: discover/search → confirm → assess → export."""
+    if not sys.stdin.isatty():
+        print("The wizard needs an interactive terminal "
+              "(stdin is not a TTY).", file=sys.stderr)
+        return 2
+    C.enabled = sys.stdout.isatty()
+
+    print(_c("1", "\n🛡️  FormSentry — interactive wizard"))
+    print(_c("2", "Read-only. Never submits responses. Only assess forms you "
+                  "own or are authorized to assess.\n"))
+
+    if not _ask_yesno("Are you authorized to assess the target(s)?"):
+        print(_c("33", "Aborted — get authorization first."))
+        return 0
+
+    print("\nWhat would you like to do?")
+    print("  1) Hunt forms by keyword (OSINT)")
+    print("  2) Hunt an organization's forms (name + domain)")
+    print("  3) Scan a web page / Linktree for forms")
+    print("  4) Assess specific form URL(s)")
+    mode = _ask("Choose 1-4", "1")
+
+    def log(m):
+        print(_c("2", m))
+
+    discovered: List[Discovered] = []
+    forms: List[str] = []
+
+    if mode == "1":
+        kw = _ask("Keywords")
+        if not kw:
+            return 0
+        print(_c("2", "\nSearching (key-free)…"))
+        discovered = osint_search(kw, on_log=log)
+    elif mode == "2":
+        kw = _ask("Organization name")
+        site = _ask("Domain (optional, e.g. example.org)") or None
+        if not kw and not site:
+            return 0
+        print(_c("2", "\nSearching (key-free)…"))
+        discovered = osint_search(kw or site, site=site, on_log=log)
+    elif mode == "3":
+        url = _ask("Page URL")
+        if not url:
+            return 0
+        depth = _ask("Crawl same-host links how deep", "0")
+        try:
+            depth_i = int(depth)
+        except ValueError:
+            depth_i = 0
+        print(_c("2", "\nScanning…"))
+        discovered, _pages = discover([url], depth=depth_i, max_pages=40,
+                                      on_log=log)
+    elif mode == "4":
+        raw = _ask("Form URL(s), space-separated")
+        forms = raw.split()
+    else:
+        print("Unknown choice.")
+        return 0
+
+    # Selection step for discovered forms
+    if discovered and not forms:
+        print(_c("1", f"\nFound {len(discovered)} form(s):"))
+        for i, d in enumerate(discovered, 1):
+            src = d.source.replace("osint:", "search: ")
+            print(f"  {i}) {d.form_url}")
+            print(_c("2", f"       via {src}"))
+        sel = _ask("Assess which? (Enter=all, e.g. 1,3 or 1-4, q=quit)", "all")
+        if sel.strip().lower() == "q":
+            return 0
+        forms = [discovered[i].form_url for i in _parse_selection(sel, len(discovered))]
+    elif not discovered and not forms:
+        print(_c("33", "\nNo forms found. Try --dorks-only to search manually."))
+        return 0
+
+    if not forms:
+        print("Nothing selected.")
+        return 0
+
+    # Approval gate before touching the forms
+    if not _ask_yesno(f"\nAssess {len(forms)} form(s) now?", default_yes=True):
+        return 0
+
+    reports: List[Report] = []
+    for i, f in enumerate(forms, 1):
+        print(_c("2", f"  · assessing {i}/{len(forms)} …"))
+        try:
+            reports.append(assess(f))
+        except Exception as e:
+            r = Report(target=f, form_id=None, title=None, description=None,
+                       accessible=False)
+            r.errors.append(f"unexpected error: {e}")
+            reports.append(r)
+
+    summary = compute_summary(reports) if len(reports) > 1 else None
+    print("\n".join(render_text(r) for r in reports))
+    if summary:
+        print(render_summary_text(summary))
+
+    # Export step
+    exp = _ask("\nExport report? (n / md / json)", "n").lower()
+    if exp.startswith("m") or exp.startswith("j"):
+        is_md = exp.startswith("m")
+        default_fn = "formsentry-report." + ("md" if is_md else "json")
+        fn = _ask("Filename", default_fn)
+        if is_md:
+            txt = ((render_summary_md(summary) + "\n") if summary else "") \
+                + render_markdown(reports)
+        else:
+            payload = {"reports": [r.as_dict() for r in reports]}
+            if summary:
+                payload["summary"] = summary
+            txt = json.dumps(payload, indent=2, ensure_ascii=False)
+        with open(fn, "w", encoding="utf-8") as fh:
+            fh.write(txt + "\n")
+        print(_c("1", f"Wrote {fn}"))
+
+    print(_c("1", "\nDone. 🛡️"))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -1006,6 +1173,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("targets", nargs="*",
                    help="Google Form URL(s)/short link(s)/id(s) — or, with "
                         "--discover, web page(s) to scan for forms.")
+    p.add_argument("-w", "--wizard", action="store_true",
+                   help="Interactive, approval-gated wizard: search/discover → "
+                        "confirm → assess → export.")
     p.add_argument("-s", "--search", metavar="KEYWORDS",
                    help="OSINT: hunt Google Forms by keyword via search dorks, "
                         "then assess what's found.")
@@ -1060,6 +1230,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.examples:
         print(EXAMPLES)
         return 0
+
+    if args.wizard:
+        return run_wizard()
 
     def log(msg):
         if not args.json:
