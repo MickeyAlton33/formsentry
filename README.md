@@ -2,12 +2,14 @@
 
 **Security & privacy assessment for Google Forms.**
 
-Point FormSentry at any Google Form — or a `forms.gle` short link — and it audits
-the form's *externally observable* security posture the way a pen tester would,
-**without ever submitting a response**. It catches the misconfigurations that
-actually leak data in the real world, and it classifies the personal data a form
-collects (in **English *and* Hebrew**), flagging national‑ID, minors', health,
-and payment data specifically.
+Point FormSentry at a Google Form **or at any web page**, and it will
+auto‑discover the Google Forms, audit each one's *externally observable*
+security posture the way a pen tester would — **without ever submitting a
+response** — and roll the whole set up into a single risk summary.
+
+It catches the misconfigurations that actually leak data in the real world, and
+it classifies the personal data each form collects (in **English *and*
+Hebrew**), flagging national‑ID, minors', health, and payment data specifically.
 
 ```
 ━━ FormSentry report ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -76,6 +78,8 @@ install -m 0755 formsentry.py /usr/local/bin/formsentry
 
 ## Usage
 
+### Assess known forms
+
 ```bash
 # single form (URL, forms.gle short link, or raw form id all work)
 python3 formsentry.py https://forms.gle/XXXXXXXX
@@ -85,10 +89,48 @@ python3 formsentry.py https://forms.gle/AAA https://docs.google.com/forms/d/e/ID
 
 # from a file (one target per line; '#' comments allowed)
 python3 formsentry.py -i targets.txt
+```
 
-# machine‑readable
-python3 formsentry.py https://forms.gle/XXXX --json
-python3 formsentry.py https://forms.gle/XXXX --md -o report.md
+### Discover & mass‑analyze 🔎
+
+Don't have the form links? Point FormSentry at a page — a Linktree, a website,
+any link hub — and it finds the forms for you, then assesses them all.
+
+```bash
+# scan a page for Google Forms and assess everything found
+python3 formsentry.py --discover https://linktr.ee/some.org
+
+# just list the forms it finds (no assessment)
+python3 formsentry.py --discover --list-only https://example.org
+
+# crawl the whole site one hop deep (same host), capped at 80 pages
+python3 formsentry.py --discover --depth 1 --max-pages 80 https://example.org
+
+# discover across many seed pages from a file
+python3 formsentry.py --discover -i seeds.txt --md -o audit.md
+```
+
+When more than one form is assessed, a **mass‑analysis summary** is printed:
+worst risk, counts by severity, which PII categories appear across the set, and
+the worst offenders first.
+
+```
+╔══ MASS ANALYSIS SUMMARY ════════════════════════════
+  Forms assessed : 4
+  Worst risk     : HIGH
+  By risk        : 2 high  2 medium
+  PII seen       : email address×4, phone number×4, name×3, minors' data×2
+  Needs attention (medium+):
+    [HIGH] Children's swim registration
+    ...
+╚═════════════════════════════════════════════════════
+```
+
+### Output & CI
+
+```bash
+python3 formsentry.py https://forms.gle/XXXX --json          # JSON
+python3 formsentry.py --discover https://site --md -o out.md # Markdown file
 
 # CI gate: exit non‑zero if anything is 'high' or worse
 python3 formsentry.py -i targets.txt --fail-on high
@@ -96,9 +138,10 @@ python3 formsentry.py -i targets.txt --fail-on high
 
 ### Output formats
 
-- **default** — colored terminal report
-- `--json` — structured JSON (array of reports), ideal for piping into `jq`
-- `--md` — Markdown report with a questions table
+- **default** — colored terminal report (+ summary when >1 form)
+- `--json` — structured JSON: `{ "reports": [...], "summary": {...}, "discovered": [...] }`
+  (`summary` present when >1 form; `discovered` present with `--discover`)
+- `--md` — Markdown report with a questions table (+ summary section)
 
 ### Exit codes
 
@@ -106,6 +149,10 @@ python3 formsentry.py -i targets.txt --fail-on high
 
 ## How it works
 
+0. *(with `--discover`)* Fetches each seed page, extracts every Google Form link
+   (`forms.gle`, `docs.google.com/forms/...`, legacy `goo.gl/forms`) — including
+   the JSON‑escaped links inside link‑hub pages — and, with `--depth`, follows
+   same‑host links to find more. De‑dupes by form id.
 1. Resolves `forms.gle` short links and normalizes any input to the published
    `/forms/d/e/<id>/` form id.
 2. `GET`s the public `viewform` page and parses the embedded

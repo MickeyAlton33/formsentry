@@ -30,11 +30,13 @@ import json
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 USER_AGENT = f"FormSentry/{__version__} (+https://github.com/MickeyAlton33/formsentry)"
 TIMEOUT = 20
@@ -327,6 +329,128 @@ def extract_questions(data: list) -> Tuple[Optional[str], Optional[str], List[Qu
 
 
 # --------------------------------------------------------------------------- #
+# Discovery — find Google Form links inside arbitrary web pages
+# --------------------------------------------------------------------------- #
+
+# Matches forms.gle, goo.gl/forms (legacy), and docs.google.com/forms links.
+# /forms/d/e/<id> is listed before /forms/d/<id> so the published id wins.
+_RE_FORM_LINK = re.compile(
+    r"https?://(?:"
+    r"forms\.gle/[A-Za-z0-9_-]+"
+    r"|goo\.gl/forms/[A-Za-z0-9_-]+"
+    r"|docs\.google\.com/forms/d/e/[A-Za-z0-9_-]+(?:/viewform)?"
+    r"|docs\.google\.com/forms/d/[A-Za-z0-9_-]+(?:/viewform)?"
+    r")",
+    re.IGNORECASE)
+
+_RE_HREF = re.compile(r"""href\s*=\s*["']([^"'#]+)""", re.IGNORECASE)
+
+_SKIP_EXT = (".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico", ".webp", ".css",
+             ".js", ".pdf", ".zip", ".rar", ".gz", ".mp4", ".mp3", ".woff",
+             ".woff2", ".ttf", ".eot")
+
+
+def _deescape(body: str) -> str:
+    """Undo the JSON/HTML escaping that hides URLs in link-hub pages."""
+    return (body.replace("\\/", "/")
+                .replace("&amp;", "&")
+                .replace("\\u003d", "=")
+                .replace("\\u0026", "&"))
+
+
+def extract_form_links(body: str) -> List[str]:
+    """All Google Form URLs in a page, de-duplicated, order preserved."""
+    seen: set = set()
+    out: List[str] = []
+    for m in _RE_FORM_LINK.finditer(_deescape(body)):
+        u = m.group(0)
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def extract_internal_links(body: str, base_url: str, host: str) -> List[str]:
+    """Same-host http(s) anchor links worth crawling further."""
+    out: List[str] = []
+    seen: set = set()
+    for m in _RE_HREF.finditer(body):
+        href = m.group(1).strip()
+        if not href or href.lower().startswith(("mailto:", "tel:", "javascript:")):
+            continue
+        nxt = urllib.parse.urljoin(base_url, href)
+        p = urllib.parse.urlparse(nxt)
+        if p.scheme not in ("http", "https"):
+            continue
+        if p.netloc != host:
+            continue
+        if nxt.lower().split("?")[0].endswith(_SKIP_EXT):
+            continue
+        nxt = nxt.split("#")[0]
+        if nxt not in seen:
+            seen.add(nxt)
+            out.append(nxt)
+    return out
+
+
+@dataclass
+class Discovered:
+    form_url: str          # canonical viewform url
+    form_id: Optional[str]
+    source: str            # page it was found on
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+def discover(seeds: List[str], depth: int = 0, max_pages: int = 40,
+             same_host: bool = True, on_log=None) -> Tuple[List[Discovered], int]:
+    """
+    Crawl seed pages for Google Form links. With depth>0, follow same-host
+    links up to `depth` hops (bounded by max_pages). Returns (forms, pages).
+    """
+    def log(msg):
+        if on_log:
+            on_log(msg)
+
+    queue: List[Tuple[str, int]] = [(s if "://" in s else "https://" + s, 0)
+                                    for s in seeds]
+    visited: set = set()
+    found: List[Discovered] = []
+    seen_keys: set = set()
+    pages = 0
+
+    while queue and pages < max_pages:
+        url, d = queue.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        try:
+            _status, final_url, body = http_get(url)
+        except RuntimeError as e:
+            log(f"  · skip {url} ({e})")
+            continue
+        pages += 1
+
+        for raw in extract_form_links(body):
+            fid, viewform = resolve_target(raw)
+            key = fid or raw
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            found.append(Discovered(form_url=viewform, form_id=fid, source=url))
+            log(f"  + form: {viewform}")
+
+        if d < depth:
+            host = urllib.parse.urlparse(final_url or url).netloc
+            for nxt in extract_internal_links(body, final_url or url, host):
+                if nxt not in visited:
+                    queue.append((nxt, d + 1))
+
+    return found, pages
+
+
+# --------------------------------------------------------------------------- #
 # The assessment
 # --------------------------------------------------------------------------- #
 
@@ -573,6 +697,81 @@ def render_markdown(reps: List[Report]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Aggregate summary (mass analysis)
+# --------------------------------------------------------------------------- #
+
+def compute_summary(reports: List[Report]) -> dict:
+    by_risk = Counter(r.risk for r in reports)
+    pii = Counter()
+    for r in reports:
+        cats = set()
+        for q in r.questions:
+            cats.update(q.pii)
+        for c in cats:
+            pii[c] += 1
+    worst = max((r.risk for r in reports), key=sev_rank, default="info")
+    flagged = [
+        {"target": r.target, "title": r.title, "risk": r.risk}
+        for r in sorted(reports, key=lambda x: -sev_rank(x.risk))
+        if sev_rank(r.risk) >= sev_rank("medium")
+    ]
+    return {
+        "forms_assessed": len(reports),
+        "worst_risk": worst,
+        "by_risk": {k: by_risk.get(k, 0) for k in reversed(SEVERITY_ORDER)
+                    if by_risk.get(k, 0)},
+        "pii_categories": dict(pii.most_common()),
+        "flagged": flagged,
+        "errored": [r.target for r in reports if r.errors and not r.accessible],
+    }
+
+
+def render_summary_text(s: dict) -> str:
+    out = [_c("1", "\n╔══ MASS ANALYSIS SUMMARY ════════════════════════════")]
+    out.append(f"  Forms assessed : {s['forms_assessed']}")
+    out.append("  Worst risk     : " +
+               _c(SEV_COLOR.get(s['worst_risk'], "0"), s['worst_risk'].upper()))
+    if s["by_risk"]:
+        parts = []
+        for k, n in s["by_risk"].items():
+            parts.append(_c(SEV_COLOR.get(k, "0"), f"{n} {k}"))
+        out.append("  By risk        : " + "  ".join(parts))
+    if s["pii_categories"]:
+        out.append("  PII seen       : " + ", ".join(
+            f"{PII_LABELS.get(c, c)}×{n}" for c, n in s["pii_categories"].items()))
+    if s["flagged"]:
+        out.append(_c("1", "\n  Needs attention (medium+):"))
+        for f in s["flagged"]:
+            badge = _c(SEV_COLOR.get(f["risk"], "0"), f"[{SEV_BADGE[f['risk']]}]")
+            out.append(f"    {badge} {f['title'] or f['target']}")
+    if s["errored"]:
+        out.append(_c("2", f"\n  Unreadable: {len(s['errored'])} target(s)"))
+    out.append(_c("1", "╚═════════════════════════════════════════════════════"))
+    return "\n".join(out)
+
+
+def render_summary_md(s: dict) -> str:
+    out = ["# FormSentry — mass analysis summary\n"]
+    out.append(f"- **Forms assessed:** {s['forms_assessed']}")
+    out.append(f"- **Worst risk:** **{s['worst_risk'].upper()}**")
+    if s["by_risk"]:
+        out.append("- **By risk:** " +
+                   ", ".join(f"{n} {k}" for k, n in s["by_risk"].items()))
+    if s["pii_categories"]:
+        out.append("- **PII categories seen (forms):** " + ", ".join(
+            f"{PII_LABELS.get(c, c)} ({n})" for c, n in s["pii_categories"].items()))
+    out.append("")
+    if s["flagged"]:
+        out.append("## Needs attention (medium+)\n")
+        out.append("| Risk | Form |")
+        out.append("|---|---|")
+        for f in s["flagged"]:
+            out.append(f"| **{f['risk'].upper()}** | {f['title'] or f['target']} |")
+        out.append("")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -582,9 +781,20 @@ def build_parser() -> argparse.ArgumentParser:
         description="Security & privacy assessment for Google Forms.",
         epilog="Only assess forms you own or are authorized to assess.")
     p.add_argument("targets", nargs="*",
-                   help="Google Form URL(s), forms.gle short link(s), or form id(s).")
+                   help="Google Form URL(s)/short link(s)/id(s) — or, with "
+                        "--discover, web page(s) to scan for forms.")
     p.add_argument("-i", "--input", metavar="FILE",
                    help="Read targets from FILE (one per line).")
+    p.add_argument("-d", "--discover", action="store_true",
+                   help="Treat targets as web pages and auto-find Google Forms "
+                        "in them (Linktree, sites, link hubs, ...).")
+    p.add_argument("--depth", type=int, default=0, metavar="N",
+                   help="With --discover, follow same-host links N hops deep "
+                        "(default 0 = only the given page).")
+    p.add_argument("--max-pages", type=int, default=40, metavar="N",
+                   help="Safety cap on pages crawled during discovery (default 40).")
+    p.add_argument("--list-only", action="store_true",
+                   help="With --discover, only list found form URLs; do not assess.")
     p.add_argument("--json", action="store_true", help="Emit JSON.")
     p.add_argument("--md", "--markdown", dest="md", action="store_true",
                    help="Emit Markdown.")
@@ -619,6 +829,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         build_parser().print_help()
         return 2
 
+    discovered: List[Discovered] = []
+
+    # ---- Discovery phase ------------------------------------------------ #
+    if args.discover:
+        def log(msg):
+            if not args.json:
+                print(msg, file=sys.stderr)
+        log(f"[discover] scanning {len(targets)} page(s), depth={args.depth} ...")
+        discovered, pages = discover(targets, depth=args.depth,
+                                     max_pages=args.max_pages, on_log=log)
+        log(f"[discover] crawled {pages} page(s); found {len(discovered)} form(s).")
+
+        if args.list_only:
+            if args.json:
+                print(json.dumps([d.as_dict() for d in discovered], indent=2,
+                                 ensure_ascii=False))
+            else:
+                for d in discovered:
+                    print(d.form_url)
+            return 0
+
+        targets = [d.form_url for d in discovered]
+        if not targets:
+            print("No Google Forms found.", file=sys.stderr)
+            return 0
+
+    # ---- Assessment phase ---------------------------------------------- #
     reports: List[Report] = []
     for t in targets:
         try:
@@ -629,13 +866,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             r.errors.append(f"unexpected error: {e}")
             reports.append(r)
 
+    summary = compute_summary(reports) if len(reports) > 1 else None
+
     if args.json:
-        text = json.dumps([r.as_dict() for r in reports], indent=2,
-                          ensure_ascii=False)
+        payload = {"reports": [r.as_dict() for r in reports]}
+        if summary:
+            payload["summary"] = summary
+        if discovered:
+            payload["discovered"] = [d.as_dict() for d in discovered]
+        text = json.dumps(payload, indent=2, ensure_ascii=False)
     elif args.md:
-        text = render_markdown(reports)
+        text = ((render_summary_md(summary) + "\n") if summary else "") \
+            + render_markdown(reports)
     else:
-        text = "\n".join(render_text(r) for r in reports)
+        body = "\n".join(render_text(r) for r in reports)
+        text = body + ("\n" + render_summary_text(summary) if summary else "")
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:

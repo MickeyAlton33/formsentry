@@ -81,6 +81,53 @@ def test_parse_public_data_minimal():
     assert "minor" in questions[0].pii
 
 
+def test_extract_form_links_variants():
+    body = '''
+      <a href="https://forms.gle/AbC123">x</a>
+      "url":"https:\\/\\/docs.google.com\\/forms\\/d\\/e\\/IDENT456\\/viewform"
+      <iframe src="https://docs.google.com/forms/d/e/IDENT456/viewform?embedded=true">
+      legacy https://goo.gl/forms/Zz9
+    '''
+    links = fs.extract_form_links(body)
+    assert any("forms.gle/AbC123" in u for u in links)
+    assert any("IDENT456" in u for u in links)
+    assert any("goo.gl/forms/Zz9" in u for u in links)
+
+
+def test_extract_form_links_dedup():
+    body = ("https://forms.gle/SAME https://forms.gle/SAME "
+            "https://forms.gle/SAME")
+    assert len(fs.extract_form_links(body)) == 1
+
+
+def test_extract_internal_links_same_host_only():
+    body = ('<a href="/about">a</a><a href="https://other.com/x">b</a>'
+            '<a href="https://site.com/contact">c</a>'
+            '<a href="/logo.png">img</a>')
+    links = fs.extract_internal_links(body, "https://site.com/", "site.com")
+    assert "https://site.com/about" in links
+    assert "https://site.com/contact" in links
+    assert all("other.com" not in u for u in links)   # off-host excluded
+    assert all(not u.endswith(".png") for u in links)  # assets excluded
+
+
+def test_compute_summary():
+    r1 = fs.Report(target="a", form_id="a", title="A", description=None,
+                   accessible=True)
+    r1.findings.append(fs.Finding("x", "high", "t", "d"))
+    r1.questions.append(fs.Question("child name", "short_answer", True, ["minor"]))
+    r2 = fs.Report(target="b", form_id="b", title="B", description=None,
+                   accessible=True)
+    r2.findings.append(fs.Finding("y", "medium", "t", "d"))
+    r2.questions.append(fs.Question("phone", "short_answer", True, ["phone"]))
+    s = fs.compute_summary([r1, r2])
+    assert s["forms_assessed"] == 2
+    assert s["worst_risk"] == "high"
+    assert s["by_risk"]["high"] == 1 and s["by_risk"]["medium"] == 1
+    assert s["pii_categories"]["minor"] == 1
+    assert len(s["flagged"]) == 2
+
+
 if __name__ == "__main__":
     import traceback
     failed = 0
