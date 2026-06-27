@@ -141,19 +141,18 @@ python3 formsentry.py --search "swimming registration tel aviv"
 python3 formsentry.py --search "country club" --dorks-only
 ```
 
-How it sources results:
+**No API keys — ever.** Search is a two-stage, key-free pipeline:
 
-1. If `FORMSENTRY_SERPAPI_KEY` is set, it queries **SerpAPI** (reliable).
-   ```bash
-   export FORMSENTRY_SERPAPI_KEY=your_key
-   python3 formsentry.py --search "membership" --site example.org
-   ```
-2. Otherwise it makes a **best-effort key-free scrape** (DuckDuckGo Lite + Bing).
-   Search engines frequently block scraping — when that happens FormSentry
-   **prints the dorks** so you can run them in a browser and feed the results
-   back with `--discover -i pages.txt`.
+1. **Search** — queries key-free engines (Mojeek as the workhorse, with
+   DuckDuckGo-Lite / Bing as best-effort fallbacks) and grabs any Google Form
+   links sitting directly in the results.
+2. **Crawl** — harvests the top organic result pages and runs them through the
+   `--discover` crawler to pull out forms embedded in those pages.
 
-Whatever it finds is piped straight into the assess + mass-analysis pipeline.
+Everything found is piped straight into the assess + mass-analysis pipeline.
+If the engines return nothing useful, FormSentry **prints ready-to-run dorks**
+so you can run them in a browser and feed the result pages back with
+`--discover -i pages.txt`.
 
 ### Examples on demand
 

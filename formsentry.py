@@ -28,7 +28,6 @@ import argparse
 import base64
 import dataclasses
 import json
-import os
 import re
 import sys
 import urllib.error
@@ -38,7 +37,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 USER_AGENT = f"FormSentry/{__version__} (+https://github.com/MickeyAlton33/formsentry)"
 TIMEOUT = 20
@@ -514,71 +513,114 @@ def _decode_search_redirects(body: str) -> str:
     return "\n".join(urls)
 
 
-def _serpapi_search(query: str, key: str) -> str:
-    """Reliable backend when FORMSENTRY_SERPAPI_KEY is set."""
-    url = ("https://serpapi.com/search.json?engine=google&num=40&q="
-           + urllib.parse.quote(query) + "&api_key=" + key)
-    body = _http_get_safe(url)
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError:
-        return ""
-    out = []
-    for r in data.get("organic_results", []):
-        if r.get("link"):
-            out.append(r["link"])
-    return "\n".join(out)
+# Key-free search front-ends, tried in order. No API keys, ever.
+# Mojeek returns clean, direct result URLs and does not captcha-gate scrapers,
+# which makes it the workhorse; DDG-lite/Bing are best-effort fallbacks.
+_SEARCH_BACKENDS = [
+    ("mojeek", "https://www.mojeek.com/search?q="),
+    ("ddg-lite", "https://lite.duckduckgo.com/lite/?q="),
+    ("bing", "https://www.bing.com/search?count=30&q="),
+]
+
+# Hosts that are search-engine chrome / social noise, not real results.
+_ENGINE_HOSTS = ("mojeek.com", "duckduckgo.com", "bing.com", "microsoft.com",
+                 "google.com", "brave.com", "searx", "yahoo.com", "msn.com",
+                 "facebook.com", "twitter.com", "x.com", "instagram.com",
+                 "youtube.com", "linkedin.com", "pinterest.com", "wikipedia.org")
 
 
 def _scrape_search(query: str) -> str:
-    """Best-effort key-free scrape (DDG Lite + Bing). May be rate-limited."""
+    """Best-effort key-free search. Returns concatenated result HTML."""
     parts = []
-    ddg = _http_get_safe("https://lite.duckduckgo.com/lite/?q="
-                         + urllib.parse.quote(query))
-    if ddg and "anomaly" not in ddg.lower():
-        parts.append(ddg)
-    bing = _http_get_safe("https://www.bing.com/search?count=30&q="
-                          + urllib.parse.quote(query))
-    if bing:
-        parts.append(bing)
+    for _name, base in _SEARCH_BACKENDS:
+        body = _http_get_safe(base + urllib.parse.quote(query))
+        if body and "anomaly" not in body.lower():
+            parts.append(body)
     return "\n".join(parts)
 
 
-def osint_search(keywords: str, site: Optional[str] = None,
-                 max_results: int = 40, on_log=None) -> Tuple[List[Discovered], bool]:
+def _extract_result_urls(body: str) -> List[str]:
+    """Organic result links from a search page (direct hrefs + DDG redirects)."""
+    cand: List[str] = []
+    for m in _RE_HREF.finditer(body):
+        cand.append(m.group(1))
+    cand.extend(_decode_search_redirects(body).splitlines())
+
+    out: List[str] = []
+    seen: set = set()
+    for u in cand:
+        u = u.strip()
+        if not u.startswith("http"):
+            continue
+        host = urllib.parse.urlparse(u).netloc.lower()
+        if any(h in host for h in _ENGINE_HOSTS):
+            continue
+        if u.lower().split("?")[0].endswith(_SKIP_EXT):
+            continue
+        u = u.split("#")[0]
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def osint_search(keywords: str, site: Optional[str] = None, max_results: int = 40,
+                 deep: bool = True, max_pages: int = 15,
+                 on_log=None) -> List[Discovered]:
     """
-    Hunt Google Forms by keyword. Returns (forms, used_api).
-    Uses SerpAPI if FORMSENTRY_SERPAPI_KEY is set, else best-effort scrape.
+    Hunt Google Forms by keyword — NO API KEYS. Two stages:
+      1. key-free web search (Mojeek + fallbacks) for direct form links, and
+      2. crawl the top organic result pages and extract forms embedded in them.
     """
     def log(msg):
         if on_log:
             on_log(msg)
 
-    key = os.environ.get("FORMSENTRY_SERPAPI_KEY", "").strip()
-    dorks = [q for q, _ in build_dorks(keywords, site)
-             if q.startswith(("site:docs.google.com/forms", "inurl:forms.gle"))
-             or site]
+    # Mojeek (the reliable backend) ignores site:/inurl: operators, so feed it
+    # plain keywords plus a forms hint; keep an operator query for engines that
+    # do support dorks.
+    queries = [f"{keywords} google form".strip()]
+    if site:
+        queries.append(f"{keywords} {site}".strip())
+    queries.append(f"site:docs.google.com/forms {keywords}".strip())
+
     found: List[Discovered] = []
     seen: set = set()
+    result_pages: List[str] = []
 
-    for q in dorks:
-        log(f"  · dork: {q}")
-        blob = _serpapi_search(q, key) if key else _scrape_search(q)
+    for q in queries:
+        log(f"  · query: {q}")
+        blob = _scrape_search(q)
         if not blob:
             continue
         haystack = blob + "\n" + _decode_search_redirects(blob)
+        # Stage 1: direct form links sitting in the SERP itself.
         for raw in extract_form_links(haystack):
             fid, viewform = resolve_target(raw)
             k = fid or raw
-            if k in seen:
-                continue
-            seen.add(k)
-            found.append(Discovered(form_url=viewform, form_id=fid,
-                                    source=f"osint:{q}"))
-            log(f"  + form: {viewform}")
-            if len(found) >= max_results:
-                return found, bool(key)
-    return found, bool(key)
+            if k not in seen:
+                seen.add(k)
+                found.append(Discovered(viewform, fid, f"osint:{q}"))
+                log(f"  + form (direct): {viewform}")
+        # Collect organic result pages to crawl in stage 2.
+        for u in _extract_result_urls(haystack):
+            if u not in result_pages:
+                result_pages.append(u)
+        if len(found) >= max_results:
+            return found[:max_results]
+
+    # Stage 2: crawl the harvested result pages for embedded forms.
+    if deep and result_pages:
+        pages = result_pages[:max_pages]
+        log(f"  · crawling {len(pages)} result page(s) for embedded forms ...")
+        crawled, _n = discover(pages, depth=0, max_pages=max_pages, on_log=on_log)
+        for d in crawled:
+            k = d.form_id or d.form_url
+            if k not in seen:
+                seen.add(k)
+                found.append(d)
+
+    return found[:max_results]
 
 
 # --------------------------------------------------------------------------- #
@@ -930,12 +972,8 @@ EXAMPLES — full command chains
   OSINT scoped to an organization's domain, JSON out
     formsentry.py --search "membership" --site example.org --json -o hits.json
 
-  OSINT: print ready-to-run search dorks (always works, no scraping)
+  OSINT: print ready-to-run search dorks (always works, zero network)
     formsentry.py --search "country club" --dorks-only
-
-  Reliable OSINT via SerpAPI (set a key once)
-    export FORMSENTRY_SERPAPI_KEY=...   # then:
-    formsentry.py --search "swim lessons" --site example.org
 
   Feed dork results back in for assessment
     formsentry.py --discover -i found_pages.txt --md -o report.md
@@ -949,10 +987,9 @@ def render_dorks(keywords: str, site: Optional[str], color: bool = True) -> str:
         out.append(_c("36", f"\n  {q}"))
         for eng in ("google", "bing", "duckduckgo"):
             out.append(f"    {eng:<11} {urls[eng]}")
-    out.append(_c("2", "\n  → Open these, collect the result pages, then assess:"))
+    out.append(_c("2", "\n  → Open these, save the pages that contain forms to "
+                       "pages.txt, then assess:"))
     out.append(_c("2", "      formsentry.py --discover -i pages.txt"))
-    out.append(_c("2", "    Or set FORMSENTRY_SERPAPI_KEY and run --search without "
-                       "--dorks-only for automatic hunting."))
     return "\n".join(out)
 
 
@@ -1037,15 +1074,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         log(f"[osint] hunting forms for: {args.search!r}"
             + (f" (site:{args.site})" if args.site else "") + " ...")
-        discovered, used_api = osint_search(args.search, site=args.site,
-                                            on_log=log)
-        log(f"[osint] found {len(discovered)} form(s) "
-            f"via {'SerpAPI' if used_api else 'best-effort scrape'}.")
+        discovered = osint_search(args.search, site=args.site, on_log=log)
+        log(f"[osint] found {len(discovered)} form(s) (key-free search).")
         if not discovered:
-            log("[osint] no forms found via live search "
-                "(search engines often block scraping).")
-            log("[osint] try these dorks manually, or set "
-                "FORMSENTRY_SERPAPI_KEY for reliable results:")
+            log("[osint] live search surfaced no forms this time "
+                "(engine coverage varies).")
+            log("[osint] run these dorks in your browser, then feed the "
+                "result pages back with: --discover -i pages.txt")
             print(render_dorks(args.search, args.site))
             return 0
 
