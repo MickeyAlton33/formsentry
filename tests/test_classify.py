@@ -128,6 +128,40 @@ def test_compute_summary():
     assert len(s["flagged"]) == 2
 
 
+def test_build_dorks():
+    dorks = fs.build_dorks("swimming", site="example.org")
+    queries = [q for q, _ in dorks]
+    assert any("site:docs.google.com/forms swimming" == q for q in queries)
+    assert any("inurl:forms.gle swimming" == q for q in queries)
+    assert any("site:example.org" in q for q in queries)
+    # each query renders to all three engines
+    for _q, urls in dorks:
+        assert set(urls) == {"google", "bing", "duckduckgo"}
+        assert all(v.startswith("https://") for v in urls.values())
+
+
+def test_build_dorks_no_site():
+    dorks = fs.build_dorks("gym membership")
+    assert all("site:example" not in q for q, _ in dorks)
+    assert len(dorks) >= 2
+
+
+def test_decode_search_redirects_ddg():
+    body = '<a href="/l/?uddg=https%3A%2F%2Fforms.gle%2FAbc123&rut=x">r</a>'
+    decoded = fs._decode_search_redirects(body)
+    assert "https://forms.gle/Abc123" in decoded
+
+
+def test_decode_then_extract():
+    import base64 as _b64
+    target = "https://docs.google.com/forms/d/e/ZZZ999/viewform"
+    enc = _b64.urlsafe_b64encode(target.encode()).decode().rstrip("=")
+    body = f'<a href="https://www.bing.com/ck/a?x&u=a1{enc}&y">hit</a>'
+    decoded = fs._decode_search_redirects(body)
+    links = fs.extract_form_links(decoded)
+    assert any("ZZZ999" in u for u in links)
+
+
 if __name__ == "__main__":
     import traceback
     failed = 0

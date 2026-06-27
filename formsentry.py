@@ -25,8 +25,10 @@ Zero third-party dependencies — standard library only. Python 3.8+.
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -36,7 +38,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 USER_AGENT = f"FormSentry/{__version__} (+https://github.com/MickeyAlton33/formsentry)"
 TIMEOUT = 20
@@ -451,6 +453,135 @@ def discover(seeds: List[str], depth: int = 0, max_pages: int = 40,
 
 
 # --------------------------------------------------------------------------- #
+# OSINT — find Google Forms by keyword via search dorks
+# --------------------------------------------------------------------------- #
+
+# Search front-ends used to *render* a dork as a clickable query URL.
+DORK_ENGINES = {
+    "google": "https://www.google.com/search?q=",
+    "bing": "https://www.bing.com/search?q=",
+    "duckduckgo": "https://duckduckgo.com/?q=",
+}
+
+
+def build_dorks(keywords: str, site: Optional[str] = None) -> List[Tuple[str, Dict[str, str]]]:
+    """
+    Turn keywords (and optional site/org) into a set of Google-Forms dorks.
+    Returns [(query, {engine: url, ...}), ...].
+    """
+    kw = keywords.strip()
+    queries: List[str] = [
+        f"site:docs.google.com/forms {kw}".strip(),
+        f"inurl:forms.gle {kw}".strip(),
+        f'{kw} (forms.gle OR "docs.google.com/forms")'.strip(),
+    ]
+    if site:
+        queries.append(f"site:{site} (forms.gle OR docs.google.com/forms)")
+        queries.append(f'"{kw}" site:{site}'.strip())
+
+    out: List[Tuple[str, Dict[str, str]]] = []
+    seen: set = set()
+    for q in queries:
+        if q in seen:
+            continue
+        seen.add(q)
+        urls = {eng: base + urllib.parse.quote(q)
+                for eng, base in DORK_ENGINES.items()}
+        out.append((q, urls))
+    return out
+
+
+def _http_get_safe(url: str) -> str:
+    try:
+        _s, _u, body = http_get(url)
+        return body
+    except RuntimeError:
+        return ""
+
+
+def _decode_search_redirects(body: str) -> str:
+    """Pull real URLs out of DuckDuckGo (uddg=) and Bing (ck/a u=a1) wrappers."""
+    urls: List[str] = []
+    for m in re.finditer(r"uddg=([^&\"']+)", body):
+        urls.append(urllib.parse.unquote(m.group(1)))
+    for m in re.finditer(r"u=a1([A-Za-z0-9_-]+)", body):
+        b = m.group(1)
+        b += "=" * ((4 - len(b) % 4) % 4)
+        try:
+            urls.append(base64.urlsafe_b64decode(b).decode("utf-8", "replace"))
+        except Exception:
+            pass
+    return "\n".join(urls)
+
+
+def _serpapi_search(query: str, key: str) -> str:
+    """Reliable backend when FORMSENTRY_SERPAPI_KEY is set."""
+    url = ("https://serpapi.com/search.json?engine=google&num=40&q="
+           + urllib.parse.quote(query) + "&api_key=" + key)
+    body = _http_get_safe(url)
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return ""
+    out = []
+    for r in data.get("organic_results", []):
+        if r.get("link"):
+            out.append(r["link"])
+    return "\n".join(out)
+
+
+def _scrape_search(query: str) -> str:
+    """Best-effort key-free scrape (DDG Lite + Bing). May be rate-limited."""
+    parts = []
+    ddg = _http_get_safe("https://lite.duckduckgo.com/lite/?q="
+                         + urllib.parse.quote(query))
+    if ddg and "anomaly" not in ddg.lower():
+        parts.append(ddg)
+    bing = _http_get_safe("https://www.bing.com/search?count=30&q="
+                          + urllib.parse.quote(query))
+    if bing:
+        parts.append(bing)
+    return "\n".join(parts)
+
+
+def osint_search(keywords: str, site: Optional[str] = None,
+                 max_results: int = 40, on_log=None) -> Tuple[List[Discovered], bool]:
+    """
+    Hunt Google Forms by keyword. Returns (forms, used_api).
+    Uses SerpAPI if FORMSENTRY_SERPAPI_KEY is set, else best-effort scrape.
+    """
+    def log(msg):
+        if on_log:
+            on_log(msg)
+
+    key = os.environ.get("FORMSENTRY_SERPAPI_KEY", "").strip()
+    dorks = [q for q, _ in build_dorks(keywords, site)
+             if q.startswith(("site:docs.google.com/forms", "inurl:forms.gle"))
+             or site]
+    found: List[Discovered] = []
+    seen: set = set()
+
+    for q in dorks:
+        log(f"  · dork: {q}")
+        blob = _serpapi_search(q, key) if key else _scrape_search(q)
+        if not blob:
+            continue
+        haystack = blob + "\n" + _decode_search_redirects(blob)
+        for raw in extract_form_links(haystack):
+            fid, viewform = resolve_target(raw)
+            k = fid or raw
+            if k in seen:
+                continue
+            seen.add(k)
+            found.append(Discovered(form_url=viewform, form_id=fid,
+                                    source=f"osint:{q}"))
+            log(f"  + form: {viewform}")
+            if len(found) >= max_results:
+                return found, bool(key)
+    return found, bool(key)
+
+
+# --------------------------------------------------------------------------- #
 # The assessment
 # --------------------------------------------------------------------------- #
 
@@ -772,17 +903,82 @@ def render_summary_md(s: dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Examples & dork rendering
+# --------------------------------------------------------------------------- #
+
+EXAMPLES = r"""
+EXAMPLES — full command chains
+
+  Assess one form
+    formsentry.py https://forms.gle/XXXXXXXX
+
+  Assess several, fail CI if any is HIGH+
+    formsentry.py https://forms.gle/AAA https://forms.gle/BBB --fail-on high
+
+  Auto-discover forms on a page and assess them all
+    formsentry.py --discover https://linktr.ee/some.org
+
+  Crawl a whole site one hop deep, write a Markdown audit
+    formsentry.py --discover --depth 1 --max-pages 80 https://example.org --md -o audit.md
+
+  Just list the forms found on a page (no assessment)
+    formsentry.py --discover --list-only https://example.org
+
+  OSINT: hunt forms by keyword, then assess what's found
+    formsentry.py --search "swimming registration tel aviv"
+
+  OSINT scoped to an organization's domain, JSON out
+    formsentry.py --search "membership" --site example.org --json -o hits.json
+
+  OSINT: print ready-to-run search dorks (always works, no scraping)
+    formsentry.py --search "country club" --dorks-only
+
+  Reliable OSINT via SerpAPI (set a key once)
+    export FORMSENTRY_SERPAPI_KEY=...   # then:
+    formsentry.py --search "swim lessons" --site example.org
+
+  Feed dork results back in for assessment
+    formsentry.py --discover -i found_pages.txt --md -o report.md
+"""
+
+
+def render_dorks(keywords: str, site: Optional[str], color: bool = True) -> str:
+    out = [_c("1", f"\nGoogle-Forms OSINT dorks for: “{keywords}”"
+                   + (f"  (site: {site})" if site else ""))]
+    for q, urls in build_dorks(keywords, site):
+        out.append(_c("36", f"\n  {q}"))
+        for eng in ("google", "bing", "duckduckgo"):
+            out.append(f"    {eng:<11} {urls[eng]}")
+    out.append(_c("2", "\n  → Open these, collect the result pages, then assess:"))
+    out.append(_c("2", "      formsentry.py --discover -i pages.txt"))
+    out.append(_c("2", "    Or set FORMSENTRY_SERPAPI_KEY and run --search without "
+                       "--dorks-only for automatic hunting."))
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="formsentry",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Security & privacy assessment for Google Forms.",
-        epilog="Only assess forms you own or are authorized to assess.")
+        epilog=EXAMPLES + "\nOnly assess forms you own or are authorized to assess.")
     p.add_argument("targets", nargs="*",
                    help="Google Form URL(s)/short link(s)/id(s) — or, with "
                         "--discover, web page(s) to scan for forms.")
+    p.add_argument("-s", "--search", metavar="KEYWORDS",
+                   help="OSINT: hunt Google Forms by keyword via search dorks, "
+                        "then assess what's found.")
+    p.add_argument("--site", metavar="DOMAIN",
+                   help="Scope --search dorks to an organization/domain.")
+    p.add_argument("--dorks-only", action="store_true",
+                   help="With --search: just print ready-to-run dork URLs "
+                        "(no network), then exit.")
+    p.add_argument("--examples", action="store_true",
+                   help="Print full command-chain examples and exit.")
     p.add_argument("-i", "--input", metavar="FILE",
                    help="Read targets from FILE (one per line).")
     p.add_argument("-d", "--discover", action="store_true",
@@ -824,23 +1020,51 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     C.enabled = sys.stdout.isatty() and not args.no_color and not args.json
 
-    targets = gather_targets(args)
-    if not targets:
-        build_parser().print_help()
-        return 2
+    if args.examples:
+        print(EXAMPLES)
+        return 0
+
+    def log(msg):
+        if not args.json:
+            print(msg, file=sys.stderr)
 
     discovered: List[Discovered] = []
 
-    # ---- Discovery phase ------------------------------------------------ #
-    if args.discover:
-        def log(msg):
-            if not args.json:
-                print(msg, file=sys.stderr)
-        log(f"[discover] scanning {len(targets)} page(s), depth={args.depth} ...")
-        discovered, pages = discover(targets, depth=args.depth,
-                                     max_pages=args.max_pages, on_log=log)
-        log(f"[discover] crawled {pages} page(s); found {len(discovered)} form(s).")
+    # ---- OSINT search phase --------------------------------------------- #
+    if args.search:
+        if args.dorks_only:
+            print(render_dorks(args.search, args.site))
+            return 0
+        log(f"[osint] hunting forms for: {args.search!r}"
+            + (f" (site:{args.site})" if args.site else "") + " ...")
+        discovered, used_api = osint_search(args.search, site=args.site,
+                                            on_log=log)
+        log(f"[osint] found {len(discovered)} form(s) "
+            f"via {'SerpAPI' if used_api else 'best-effort scrape'}.")
+        if not discovered:
+            log("[osint] no forms found via live search "
+                "(search engines often block scraping).")
+            log("[osint] try these dorks manually, or set "
+                "FORMSENTRY_SERPAPI_KEY for reliable results:")
+            print(render_dorks(args.search, args.site))
+            return 0
 
+    targets = gather_targets(args)
+
+    if not targets and not discovered:
+        build_parser().print_help()
+        return 2
+
+    # ---- Discovery phase ------------------------------------------------ #
+    if args.discover and targets:
+        log(f"[discover] scanning {len(targets)} page(s), depth={args.depth} ...")
+        found, pages = discover(targets, depth=args.depth,
+                                max_pages=args.max_pages, on_log=log)
+        discovered = discovered + found
+        log(f"[discover] crawled {pages} page(s); found {len(found)} form(s).")
+
+    # Forms gathered by --discover/--search become the assessment targets.
+    if args.discover or args.search:
         if args.list_only:
             if args.json:
                 print(json.dumps([d.as_dict() for d in discovered], indent=2,
@@ -849,7 +1073,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for d in discovered:
                     print(d.form_url)
             return 0
-
         targets = [d.form_url for d in discovered]
         if not targets:
             print("No Google Forms found.", file=sys.stderr)
@@ -881,6 +1104,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         body = "\n".join(render_text(r) for r in reports)
         text = body + ("\n" + render_summary_text(summary) if summary else "")
+        text += _c("2",
+                   "\n\nNext steps (full chains):"
+                   "\n  org-wide hunt : formsentry.py --search \"<org name>\" "
+                   "--site <domain>"
+                   "\n  page discover : formsentry.py --discover --depth 1 <url>"
+                   "\n  CI gate       : formsentry.py -i targets.txt --fail-on high"
+                   "\n  all examples  : formsentry.py --examples")
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:

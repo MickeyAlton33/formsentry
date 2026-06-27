@@ -126,6 +126,41 @@ the worst offenders first.
 ╚═════════════════════════════════════════════════════
 ```
 
+### OSINT: find forms by keyword / organization 🕵️
+
+Don't even have a page to start from? Hunt forms by keyword.
+
+```bash
+# search forms related to an ORGANIZATION (scope dorks to its domain)
+python3 formsentry.py --search "Country HaAliya" --site example.org
+
+# search forms by KEYWORD (free text)
+python3 formsentry.py --search "swimming registration tel aviv"
+
+# just print ready-to-run dorks (always works, no scraping) for Google/Bing/DDG
+python3 formsentry.py --search "country club" --dorks-only
+```
+
+How it sources results:
+
+1. If `FORMSENTRY_SERPAPI_KEY` is set, it queries **SerpAPI** (reliable).
+   ```bash
+   export FORMSENTRY_SERPAPI_KEY=your_key
+   python3 formsentry.py --search "membership" --site example.org
+   ```
+2. Otherwise it makes a **best-effort key-free scrape** (DuckDuckGo Lite + Bing).
+   Search engines frequently block scraping — when that happens FormSentry
+   **prints the dorks** so you can run them in a browser and feed the results
+   back with `--discover -i pages.txt`.
+
+Whatever it finds is piped straight into the assess + mass-analysis pipeline.
+
+### Examples on demand
+
+```bash
+python3 formsentry.py --examples     # full command chains for every mode
+```
+
 ### Output & CI
 
 ```bash
