@@ -37,7 +37,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 USER_AGENT = f"FormSentry/{__version__} (+https://github.com/MickeyAlton33/formsentry)"
 TIMEOUT = 20
@@ -133,15 +133,18 @@ PII_RULES: List[Tuple[str, str, str]] = [
      r"\b(ssn|social security|national id|passport)\b|תעודת\s*זהות|תעודת\s*זה|ת\.?\s*ז\.?|דרכון|ת\"ז"),
     ("health", "high",
      r"health|medical|disease|allerg|disab|diagnos|medication|בריאות|רפואי|מחלה|אלרגי|אלרג|נכות|תרופ|רגישות"),
+    # Child-specific only. Generic "age"/"גיל"/"date of birth" live under `dob`
+    # so an adult job applicant's age field isn't misread as minors' data.
     ("minor", "high",
-     r"child|children|kid|minor|son|daughter|pupil|date of birth|birthdate|\bage\b|ילד|ילדה|ילדי|קטין|תאריך\s*לידה|גיל\b|בן/בת\s*כמה|תלמיד"),
+     r"child|children|\bkid|minor|son|daughter|pupil|ילד|ילדה|ילדי|קטין|בן/בת\s*כמה|תלמיד"),
     ("address", "medium",
      r"(?<!e-mail\s)(?<!email\s)home\s*address|street\b|zip\s*code|postal"
      r"|כתובת(?!\s*ה?(?:מייל|אימייל|דוא))|רחוב|מיקוד|עיר\b|יישוב"),
     ("phone", "medium",
      r"phone|mobile|cell|tel\b|whatsapp|טלפון|נייד|פלאפון|וואטסאפ|וטסאפ|מס'?\s*טלפון"),
+    # "age" in any form; (?<!ר) avoids רגיל/תרגיל ("regular"/"exercise").
     ("dob", "medium",
-     r"date of birth|birthdate|d\.?o\.?b\.?|תאריך\s*לידה"),
+     r"date of birth|birthdate|d\.?o\.?b\.?|\bage\b|תאריך\s*לידה|(?<![רת])גיל"),
     ("financial", "medium",
      r"income|salary|bank\s*account|iban|הכנסה|משכורת|חשבון\s*בנק|בנק\b"),
     ("government", "medium",

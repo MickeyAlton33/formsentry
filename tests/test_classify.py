@@ -17,6 +17,20 @@ def test_minor_detection_english():
     assert "minor" in fs.classify_pii("Child's age")
 
 
+def test_generic_age_is_dob_not_minor():
+    # an applicant's age must NOT be flagged as minors' data
+    assert "minor" not in fs.classify_pii("מה גילך?")
+    assert "dob" in fs.classify_pii("מה גילך?")
+    assert "minor" not in fs.classify_pii("What is your age?")
+    assert "dob" in fs.classify_pii("Date of birth")
+
+
+def test_child_age_still_minor():
+    # but a child's age/name still is
+    assert "minor" in fs.classify_pii("גיל הילד/ה")
+    assert "minor" in fs.classify_pii("Child's age")
+
+
 def test_national_id():
     assert "national_id" in fs.classify_pii("תעודת זהות")
     assert "national_id" in fs.classify_pii('מספר ת"ז')
