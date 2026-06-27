@@ -37,7 +37,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 USER_AGENT = f"FormSentry/{__version__} (+https://github.com/MickeyAlton33/formsentry)"
 TIMEOUT = 20
@@ -347,6 +347,14 @@ _RE_FORM_LINK = re.compile(
     r")",
     re.IGNORECASE)
 
+# A LEAKED EDITOR link: /forms/d/<editor-id>(/edit) — note the absence of the
+# /e/ segment used by published forms. If this appears on a public page, anyone
+# can edit the form and read its responses. That's a critical exposure.
+_RE_FORM_EDIT = re.compile(
+    r"https?://docs\.google\.com/forms/d/(?!e/)[A-Za-z0-9_-]{20,}"
+    r"(?:/(?:edit|viewform|prefill))?",
+    re.IGNORECASE)
+
 _RE_HREF = re.compile(r"""href\s*=\s*["']([^"'#]+)""", re.IGNORECASE)
 
 _SKIP_EXT = (".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico", ".webp", ".css",
@@ -367,6 +375,18 @@ def extract_form_links(body: str) -> List[str]:
     seen: set = set()
     out: List[str] = []
     for m in _RE_FORM_LINK.finditer(_deescape(body)):
+        u = m.group(0)
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def find_editable_links(body: str) -> List[str]:
+    """Leaked editor links (/forms/d/<editor-id>) found on a page — critical."""
+    seen: set = set()
+    out: List[str] = []
+    for m in _RE_FORM_EDIT.finditer(_deescape(body)):
         u = m.group(0)
         if u not in seen:
             seen.add(u)
@@ -402,6 +422,7 @@ class Discovered:
     form_url: str          # canonical viewform url
     form_id: Optional[str]
     source: str            # page it was found on
+    editable: bool = False  # True if this is a leaked /forms/d/<editor-id> link
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -444,6 +465,14 @@ def discover(seeds: List[str], depth: int = 0, max_pages: int = 40,
             seen_keys.add(key)
             found.append(Discovered(form_url=viewform, form_id=fid, source=url))
             log(f"  + form: {viewform}")
+
+        for edit_url in find_editable_links(body):
+            if edit_url in seen_keys:
+                continue
+            seen_keys.add(edit_url)
+            found.append(Discovered(form_url=edit_url, form_id=None,
+                                    source=url, editable=True))
+            log(f"  !! LEAKED EDITOR LINK: {edit_url}")
 
         if d < depth:
             host = urllib.parse.urlparse(final_url or url).netloc
@@ -1201,6 +1230,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Safety cap on pages crawled during discovery (default 40).")
     p.add_argument("--list-only", action="store_true",
                    help="With --discover, only list found form URLs; do not assess.")
+    p.add_argument("--exposure-only", action="store_true",
+                   help="Report only hard exposures (public answers/scores, "
+                        "leaked editor links, file uploads); hide data-collection "
+                        "(PII) findings.")
     p.add_argument("--json", action="store_true", help="Emit JSON.")
     p.add_argument("--md", "--markdown", dest="md", action="store_true",
                    help="Emit Markdown.")
@@ -1284,13 +1317,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for d in discovered:
                     print(d.form_url)
             return 0
-        targets = [d.form_url for d in discovered]
-        if not targets:
+        targets = [d.form_url for d in discovered if not d.editable]
+        if not targets and not any(d.editable for d in discovered):
             print("No Google Forms found.", file=sys.stderr)
             return 0
 
     # ---- Assessment phase ---------------------------------------------- #
     reports: List[Report] = []
+
+    # Leaked editor links become critical reports without being "assessed".
+    for d in discovered:
+        if not d.editable:
+            continue
+        r = Report(target=d.form_url, form_id=None, title="(leaked editor link)",
+                   description=None, accessible=False)
+        r.findings.append(Finding(
+            id="leaked-editable-form",
+            severity="critical",
+            title="Leaked editable-form link",
+            detail=f"A form EDITOR URL is exposed on {d.source}. Anyone with "
+                   "this link can edit the form's questions/settings and read "
+                   "all collected responses.",
+            recommendation="Never share /edit links. In the form: Share → "
+                           "remove broad access; rotate the form if it was "
+                           "indexed."))
+        reports.append(r)
+
     for t in targets:
         try:
             reports.append(assess(t))
@@ -1299,6 +1351,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                        accessible=False)
             r.errors.append(f"unexpected error: {e}")
             reports.append(r)
+
+    # --exposure-only: drop data-collection (PII) findings, keep hard exposures.
+    if args.exposure_only:
+        for r in reports:
+            r.findings = [f for f in r.findings if not f.id.startswith("pii-")]
 
     summary = compute_summary(reports) if len(reports) > 1 else None
 

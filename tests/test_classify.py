@@ -108,6 +108,22 @@ def test_extract_form_links_variants():
     assert any("goo.gl/forms/Zz9" in u for u in links)
 
 
+def test_find_editable_links():
+    body = '''
+      <a href="https://docs.google.com/forms/d/1AbcdEFGhijklMNOpqrstUVWxyz0123456789ABCD/edit">edit</a>
+      published: https://docs.google.com/forms/d/e/1FAIpQLScPUBLISHED_id_here_not_editor/viewform
+    '''
+    edits = fs.find_editable_links(body)
+    assert any("/forms/d/1Abcd" in u for u in edits)
+    # the published /forms/d/e/ link must NOT be treated as editable
+    assert all("/d/e/" not in u for u in edits)
+
+
+def test_find_editable_links_none_on_published_only():
+    body = 'https://docs.google.com/forms/d/e/1FAIpQLScXYZ/viewform'
+    assert fs.find_editable_links(body) == []
+
+
 def test_extract_form_links_dedup():
     body = ("https://forms.gle/SAME https://forms.gle/SAME "
             "https://forms.gle/SAME")
